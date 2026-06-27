@@ -19,6 +19,7 @@ function createMockRuntime(): CoordinatorRuntime & {
   sentMessages: { handle: string; text: string }[]
   terminals: { handle: string; worktreeId: string; connected: boolean; writable: boolean }[]
   createdTerminals: string[]
+  closedTerminals: string[]
   probeDriftCalls: string[]
   probeDriftResult: DriftResult
   setProbeDrift(result: DriftResult): void
@@ -33,6 +34,7 @@ function createMockRuntime(): CoordinatorRuntime & {
       writable: boolean
     }[],
     createdTerminals: [] as string[],
+    closedTerminals: [] as string[],
     probeDriftCalls: [] as string[],
     probeDriftResult: null as DriftResult,
     throwProbeDrift: null as Error | null,
@@ -51,6 +53,11 @@ function createMockRuntime(): CoordinatorRuntime & {
       mock.createdTerminals.push(handle)
       mock.terminals.push({ handle, worktreeId: 'wt1', connected: true, writable: true })
       return { handle, worktreeId: 'wt1', title: opts?.title ?? '' }
+    },
+    async closeTerminal(handle: string) {
+      mock.closedTerminals.push(handle)
+      mock.terminals = mock.terminals.filter((terminal) => terminal.handle !== handle)
+      return { handle, ptyKilled: true }
     },
     async waitForTerminal(handle: string) {
       return { handle, condition: 'exit' }
@@ -229,6 +236,33 @@ describe('Coordinator', () => {
 
     const result = await runPromise
     expect(result.status).toBe('completed')
+    expect(runtime.closedTerminals).toEqual([runtime.createdTerminals[0]])
+  })
+
+  it('does not close a worker terminal that the coordinator did not create', async () => {
+    db = new OrchestrationDb(':memory:')
+    const runtime = createMockRuntime()
+    runtime.terminals = [{ handle: 'term_a', worktreeId: 'wt1', connected: true, writable: true }]
+
+    const task = db.createTask({ spec: 'work' })
+
+    const coordinator = new Coordinator(db, runtime, {
+      spec: 'go',
+      coordinatorHandle: 'coord',
+      pollIntervalMs: 50
+    })
+
+    const runPromise = coordinator.run()
+
+    await new Promise((r) => {
+      setTimeout(r, 100)
+    })
+
+    insertWorkerDone(db, { taskId: task.id, from: 'term_a' })
+
+    const result = await runPromise
+    expect(result.status).toBe('completed')
+    expect(runtime.closedTerminals).toEqual([])
   })
 
   it('handles escalation and circuit breaker', async () => {

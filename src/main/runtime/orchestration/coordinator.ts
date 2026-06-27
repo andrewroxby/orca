@@ -16,6 +16,7 @@ export type CoordinatorRuntime = {
     worktreeSelector?: string,
     opts?: { command?: string; title?: string }
   ): Promise<{ handle: string; worktreeId: string }>
+  closeTerminal(handle: string): Promise<unknown>
   waitForTerminal(
     handle: string,
     options?: { condition?: string; timeoutMs?: number }
@@ -92,6 +93,7 @@ export class Coordinator {
   private db: OrchestrationDb
   private runtime: CoordinatorRuntime
   private state: CoordinatorState
+  private managedWorkerHandles = new Set<string>()
   private stopped = false
   private opts: Required<Omit<CoordinatorOptions, 'onLog' | 'worktree'>> & {
     onLog: (msg: string) => void
@@ -217,7 +219,7 @@ export class Coordinator {
   }
 
   private async tick(): Promise<boolean> {
-    this.processMessages()
+    await this.processMessages()
     this.processEscalations()
     this.processDecisionGates()
     this.warnStaleDispatches()
@@ -241,7 +243,7 @@ export class Coordinator {
     }
   }
 
-  private processMessages(): void {
+  private async processMessages(): Promise<void> {
     const messages = this.db.getUnreadMessages(this.opts.coordinatorHandle)
     if (messages.length === 0) {
       return
@@ -250,7 +252,7 @@ export class Coordinator {
     for (const msg of messages) {
       switch (msg.type) {
         case 'worker_done':
-          this.handleLifecycleMessage(msg)
+          await this.handleLifecycleMessage(msg)
           break
         case 'escalation':
           this.handleEscalation(msg)
@@ -274,12 +276,26 @@ export class Coordinator {
     this.db.markAsRead(messages.map((m) => m.id))
   }
 
-  private handleLifecycleMessage(msg: MessageRow): void {
+  private async handleLifecycleMessage(msg: MessageRow): Promise<void> {
     const result = reconcileLifecycleMessage(this.db, msg, this.opts.onLog)
     if (result.action === 'completed') {
       if (!this.state.completedTasks.includes(result.taskId)) {
         this.state.completedTasks.push(result.taskId)
       }
+      await this.closeManagedWorkerTerminal(msg.from_handle)
+    }
+  }
+
+  private async closeManagedWorkerTerminal(handle: string): Promise<void> {
+    if (!this.managedWorkerHandles.delete(handle)) {
+      return
+    }
+    try {
+      await this.runtime.closeTerminal(handle)
+      this.opts.onLog(`Closed worker terminal ${handle}`)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      this.opts.onLog(`Failed to close worker terminal ${handle}: ${message}`)
     }
   }
 
@@ -394,6 +410,7 @@ export class Coordinator {
         const created = await this.runtime.createTerminal(this.opts.worktree, {
           title: `Worker: ${readyTasks[0].spec.slice(0, 40)}`
         })
+        this.managedWorkerHandles.add(created.handle)
         terminals.push(created.handle)
         this.opts.onLog(`Created worker terminal ${created.handle}`)
       } catch (err) {
